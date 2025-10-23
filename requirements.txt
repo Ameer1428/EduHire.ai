@@ -44,7 +44,6 @@ fastapi==0.115.2
 uvicorn==0.30.6
 
 # Optional visualization and debugging
-# matplotlib==3.9.2
 plotly==5.24.1
 rich==13.8.1
 
