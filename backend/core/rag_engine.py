@@ -9,15 +9,17 @@ from langchain.prompts import PromptTemplate
 from langchain_openai import AzureChatOpenAI
 from datetime import datetime
 from .vector_store import VectorStore
+from .job_api import JobAPIService
 
 class RAGEngine:
     def __init__(self, vector_store: VectorStore):
         self.vector_store = vector_store
         self.llm = self._setup_llm()
-        self.document_processor = DocumentProcessor(vector_store) 
+        self.document_processor = DocumentProcessor(vector_store)
+        self.job_api = JobAPIService()
         
     def _setup_llm(self):
-        """Setup Azure OpenAI LLM - FIXED for your specific model"""
+        """Setup Azure OpenAI LLM """
         try:
             print("🔧 Initializing Azure OpenAI for RAG...")
             
@@ -29,7 +31,7 @@ class RAGEngine:
                 deployment_name=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5-mini"),
                 temperature=1,
                 model_kwargs={
-                    "max_completion_tokens": 3000
+                    "max_completion_tokens": 5000
                 }
             )
             
@@ -48,29 +50,47 @@ class RAGEngine:
         """Public method to process uploaded documents"""
         return self.document_processor.process_uploaded_documents(documents, user_id)
 
-    def query_jobs(self, query: str, user_profile: Dict = None, n_results: int = 10) -> Dict[str, Any]:
-        """Enhanced job query with client-side filtering - MORE RELIABLE"""
+    def query_jobs(self, query: str, user_profile: Dict = None, n_results: int = 10, use_api: bool = True) -> Dict[str, Any]:
+        """Enhanced job query with better API integration"""
         try:
-            # Search without filters first (get more results to filter)
-            enhanced_query = self._enhance_job_query(query, user_profile)
-            results = self.vector_store.search("job_descriptions", enhanced_query, n_results * 3)  # Get more results
+            all_jobs = []
             
-            # Filter results client-side based on user profile
-            filtered_results = self._filter_jobs_client_side(results, user_profile)
+            # 1. Get jobs from local database (CSV) - use fallback to get all
+            local_results = self.vector_store.search("job_descriptions", "", 50)  # Get all local jobs
+            if local_results:
+                all_jobs.extend(local_results)
+                print(f"📊 Found {len(local_results)} jobs from local database")
             
-            # Score and rank jobs based on relevance to user profile
-            ranked_results = self._rank_jobs_by_relevance(filtered_results, user_profile)
+            # 2. Get jobs from API (if enabled)
+            if use_api:
+                location = user_profile.get("location", "") if user_profile else ""
+                api_results = self.job_api.search_jobs(query, location)
+                
+                if api_results.get("success") and api_results.get("jobs"):
+                    api_jobs = api_results["jobs"]
+                    all_jobs.extend(api_jobs)
+                    print(f"🌐 Found {len(api_jobs)} jobs from API")
             
-            # Extract insights from job results
-            insights = self._extract_job_insights(ranked_results)
+            # 3. Apply VERY minimal filtering - only basic location matching
+            filtered_jobs = self._minimal_filter_jobs(all_jobs, user_profile)
+            
+            # 4. Rank by relevance but don't exclude any jobs
+            ranked_jobs = self._soft_rank_jobs_by_relevance(filtered_jobs, user_profile)
+            
+            # 5. Extract insights
+            insights = self._extract_job_insights(ranked_jobs)
             
             return {
-                "jobs": ranked_results[:n_results],
+                "jobs": ranked_jobs[:n_results],
                 "query": query,
                 "filters_applied": user_profile,
                 "insights": insights,
-                "total_found": len(ranked_results),
-                "recommendations": self._generate_job_recommendations(ranked_results, user_profile)
+                "total_found": len(ranked_jobs),
+                "sources": {
+                    "local_database": len([j for j in ranked_jobs if j.get('source') != 'api']),
+                    "api": len([j for j in ranked_jobs if j.get('source') == 'api'])
+                },
+                "recommendations": self._generate_job_recommendations(ranked_jobs, user_profile)
             }
             
         except Exception as e:
@@ -80,8 +100,93 @@ class RAGEngine:
                 "error": f"Job search failed: {str(e)}"
             }
 
+    def _minimal_filter_jobs(self, jobs: List[Dict], user_profile: Dict) -> List[Dict]:
+        """Minimal filtering - only exclude obvious mismatches"""
+        if not user_profile:
+            return jobs
+        
+        filtered_jobs = []
+        
+        for job in jobs:
+            include_job = True
+            metadata = job.get("metadata", {})
+            
+            # Only apply basic location filtering
+            if user_profile.get("location"):
+                user_location = user_profile["location"].lower()
+                job_location = str(metadata.get("location", "")).lower()
+                
+                # Very permissive location matching
+                if user_location and job_location:
+                    # If user wants remote, accept almost anything
+                    if "remote" in user_location:
+                        include_job = True  # Accept all jobs for remote preference
+                    # If user wants specific location, do very basic matching
+                    elif not any(loc in job_location for loc in user_location.split(',')):
+                        include_job = False
+            
+            # Very basic experience filtering (only exclude extreme mismatches)
+            if include_job and user_profile.get("experience_level"):
+                user_exp = user_profile["experience_level"].lower()
+                job_exp = str(metadata.get("experience_level", "")).lower()
+                
+                # Only exclude if it's a clear extreme mismatch
+                if user_exp == "entry" and "senior" in job_exp and "lead" in job_exp:
+                    include_job = False
+                elif user_exp == "senior" and "entry" in job_exp and "junior" in job_exp:
+                    include_job = False
+            
+            if include_job:
+                filtered_jobs.append(job)
+        
+        print(f"🔍 Minimal filtering: {len(jobs)} -> {len(filtered_jobs)} jobs")
+        return filtered_jobs
+
+    def _soft_rank_jobs_by_relevance(self, jobs: List[Dict], user_profile: Dict) -> List[Dict]:
+        """Soft ranking - don't exclude jobs, just order them"""
+        if not user_profile:
+            return jobs
+        
+        scored_jobs = []
+        user_skills = set(user_profile.get("skills", []))
+        
+        for job in jobs:
+            score = 0
+            metadata = job.get("metadata", {})
+            
+            # Skill matching (gentle scoring)
+            job_skills = set()
+            skills_data = metadata.get("required_skills", "")
+            if isinstance(skills_data, str) and skills_data:
+                job_skills = set([s.strip() for s in skills_data.split(',')])
+            
+            if job_skills:
+                skill_match_count = len(user_skills.intersection(job_skills))
+                score += skill_match_count * 10  # Gentle scoring
+            
+            # Location preference (gentle bonus)
+            user_location = user_profile.get("location", "").lower()
+            job_location = str(metadata.get("location", "")).lower()
+            if user_location and job_location:
+                if user_location in job_location or job_location in user_location:
+                    score += 5
+            
+            # Experience level matching (small bonus)
+            user_exp = user_profile.get("experience_level", "").lower()
+            job_exp = str(metadata.get("experience_level", "")).lower()
+            if user_exp and job_exp:
+                if user_exp in job_exp or job_exp in user_exp:
+                    score += 3
+            
+            job["relevance_score"] = score
+            job["skill_match"] = f"{len(user_skills.intersection(job_skills))}/{len(job_skills)}" if job_skills else "N/A"
+            scored_jobs.append(job)
+        
+        # Sort by score but include ALL jobs
+        return sorted(scored_jobs, key=lambda x: x["relevance_score"], reverse=True)
+
     def _filter_jobs_client_side(self, jobs: List[Dict], user_profile: Dict) -> List[Dict]:
-        """Filter jobs client-side based on user profile"""
+        """Filter jobs client-side based on user profile - IMPROVED LOCATION FILTERING"""
         if not user_profile:
             return jobs
         
@@ -91,27 +196,46 @@ class RAGEngine:
             match = True
             metadata = job.get("metadata", {})
             
-            # Location filter
+            # Location filter - IMPROVED with flexible matching
             if user_profile.get("location"):
-                user_locations = [loc.strip().lower() for loc in user_profile["location"].split(',')]
+                user_location = user_profile["location"].lower().strip()
                 job_location = str(metadata.get("location", "")).lower()
                 
+                # Handle different location preferences
                 location_match = False
-                for user_loc in user_locations:
-                    if user_loc in job_location or job_location in user_loc:
+                
+                if user_location == "remote":
+                    # For remote preference, accept remote, hybrid, or any location
+                    if ("remote" in job_location or 
+                        "hybrid" in job_location or 
+                        "any" in job_location or
+                        "flexible" in job_location):
                         location_match = True
-                        break
+                    else:
+                        # Also accept if job doesn't specify remote but user wants remote
+                        location_match = True  # Be more permissive for remote
+                        
+                elif user_location and job_location:
+                    # For specific location, check for partial matches
+                    if (user_location in job_location or 
+                        job_location in user_location or
+                        any(city in job_location for city in user_location.split(','))):
+                        location_match = True
                 
                 if not location_match:
                     match = False
             
-            # Experience level filter
+            # Experience level filter - IMPROVED with better matching
             if user_profile.get("experience_level") and match:
                 user_exp = user_profile["experience_level"].lower()
                 job_exp = str(metadata.get("experience_level", "")).lower()
                 
-                if user_exp and job_exp and user_exp not in job_exp:
-                    match = False
+                # More flexible experience matching
+                if user_exp == "entry" and job_exp == "senior":
+                    match = False  # Entry-level user probably not suitable for senior roles
+                elif user_exp == "senior" and job_exp == "entry":
+                    match = False  # Senior user probably overqualified for entry roles
+                # For mid-level or unspecified, be more flexible
             
             if match:
                 filtered_jobs.append(job)
@@ -329,7 +453,7 @@ class RAGEngine:
         return recommendations
 
     def initialize_job_dataset(self, csv_path: str = "data/job_dataset.csv") -> bool:
-        """Initialize job dataset from CSV file - FIXED METADATA TYPES"""
+        """Initialize job dataset from CSV file - FIXED COLUMN MAPPING"""
         try:
             if not os.path.exists(csv_path):
                 print(f"❌ Job dataset not found at: {csv_path}")
@@ -338,62 +462,144 @@ class RAGEngine:
             # Read CSV file
             df = pd.read_csv(csv_path)
             print(f"📊 Loaded job dataset with {len(df)} entries")
+            print(f"📋 Columns: {list(df.columns)}")
             
-            # Add jobs directly to vector store
+            # Clear existing job data first
+            self.vector_store.clear_collection("job_descriptions")
+            
             jobs_added = 0
             
             for index, row in df.iterrows():
-                # Create job content
-                job_content = f"""
-                    Title: {row.get('title', '')}
-                    Company: {row.get('company', '')}
-                    Location: {row.get('location', '')}
-                    Description: {row.get('description', '')}
-                    Required Skills: {row.get('required_skills', '')}
-                    Experience Level: {row.get('experience_level', '')}
-                    Job Type: {row.get('job_type', '')}
-                    Salary: {row.get('salary', '')}
-                    Posted Date: {row.get('posted_date', '')}
-                    """
+                try:
+                    # Map CSV columns to expected fields
+                    title = row.get('Job Title') or row.get('Title') or row.get('Enrich Job')
+                    company = row.get('Company Name') or row.get('Enrich Company')
+                    location = row.get('Location', 'Remote')
+                    description = row.get('Description', 'No description available')
+                    
+                    # Debug first few rows
+                    if index < 3:
+                        print(f"🔍 Row {index} mapped:")
+                        print(f"   Title: {title}")
+                        print(f"   Company: {company}")
+                        print(f"   Location: {location}")
+                    
+                    # Skip if essential fields are empty
+                    if not title or pd.isna(title):
+                        print(f"⚠️ Skipping row {index} - empty title")
+                        continue
+                    
+                    # Create job content
+                    job_content = f"""
+                        Title: {title}
+                        Company: {company}
+                        Location: {location}
+                        Description: {description}
+                        Required Skills: {self._extract_skills_from_description(description)}
+                        Experience Level: {self._extract_experience_level(description)}
+                        Job Type: Full-time
+                        Posted Date: {row.get('Posted On', 'Not specified')}
+                        """
+                    
+                    # Create metadata with proper field mapping
+                    job_metadata = {
+                        "title": str(title).strip(),
+                        "company": str(company).strip() if company and not pd.isna(company) else "Unknown Company",
+                        "location": str(location).strip() if location and not pd.isna(location) else "Remote",
+                        "description": str(description).strip()[:500],
+                        "required_skills": self._extract_skills_from_description(description),
+                        "experience_level": self._extract_experience_level(description),
+                        "job_type": "Full-time",
+                        "salary": "Not specified",
+                        "min_salary": 0,
+                        "posted_date": str(row.get('Posted On', '')).strip(),
+                        "user_id": "system",
+                        "doc_type": "job",
+                        "source": "job_dataset",
+                        "row_index": index
+                    }
+                    
+                    # Add to vector store
+                    chunks_added = self.vector_store.add_document_content(
+                        content=job_content,
+                        metadata=job_metadata,
+                        collection_name="job_descriptions"
+                    )
+                    
+                    jobs_added += 1
+                    if jobs_added <= 3:  # Debug first 3 successful jobs
+                        print(f"✅ Added job {jobs_added}: {job_metadata['title']} at {job_metadata['company']}")
+                        
+                except Exception as e:
+                    print(f"❌ Failed to process row {index}: {e}")
+                    continue
                 
-                # Convert skills list to string for metadata
-                skills_list = self._parse_skills(row.get('required_skills', ''))
-                skills_string = ", ".join(skills_list) if skills_list else ""
-                
-                # Create metadata - ONLY strings, numbers, or booleans
-                job_metadata = {
-                    "title": str(row.get('title', '')),
-                    "company": str(row.get('company', '')),
-                    "location": str(row.get('location', '')),
-                    "description": str(row.get('description', ''))[:500],  # Limit length
-                    "required_skills": skills_string,  # Convert list to string
-                    "experience_level": str(row.get('experience_level', '')),
-                    "job_type": str(row.get('job_type', '')),
-                    "salary": str(row.get('salary', '')),
-                    "min_salary": int(self._extract_min_salary(row.get('salary', ''))),
-                    "posted_date": str(row.get('posted_date', '')),
-                    "user_id": "system",
-                    "doc_type": "job",
-                    "source": "job_dataset"
-                }
-                
-                # Add directly to vector store using new method
-                chunks_added = self.vector_store.add_document_content(
-                    content=job_content,
-                    metadata=job_metadata,
-                    collection_name="job_descriptions"
-                )
-                
-                jobs_added += 1
-                if index % 10 == 0:  # Progress indicator
-                    print(f"📝 Added {jobs_added} jobs...")
-            
             print(f"✅ Successfully added {jobs_added} jobs to vector database")
             return True
             
         except Exception as e:
             print(f"❌ Failed to initialize job dataset: {e}")
+            import traceback
+            traceback.print_exc()
             return False
+
+    def _extract_skills_from_description(self, description: str) -> str:
+        """Extract skills from job description"""
+        try:
+            if pd.isna(description) or not description:
+                return "Not specified"
+            
+            # Common tech skills to look for
+            skills_keywords = [
+                'Python', 'Java', 'JavaScript', 'TypeScript', 'React', 'Node.js', 'AWS', 'Azure', 'GCP',
+                'Machine Learning', 'AI', 'LLM', 'GenAI', 'RAG', 'LangChain', 'OpenAI', 'Docker', 'Kubernetes',
+                'SQL', 'NoSQL', 'MongoDB', 'PostgreSQL', 'FastAPI', 'Flask', 'Django', 'REST API', 'Microservices',
+                'TensorFlow', 'PyTorch', 'scikit-learn', 'pandas', 'numpy'
+            ]
+            
+            found_skills = []
+            desc_lower = str(description).lower()
+            
+            for skill in skills_keywords:
+                if skill.lower() in desc_lower:
+                    found_skills.append(skill)
+            
+            return ", ".join(found_skills[:10]) if found_skills else "Python, AI, Machine Learning"
+            
+        except Exception as e:
+            return "Python, AI, Machine Learning"
+
+    def _extract_experience_level(self, description: str) -> str:
+        """Extract experience level from description"""
+        try:
+            if pd.isna(description) or not description:
+                return "Not specified"
+            
+            desc_lower = str(description).lower()
+            
+            if 'senior' in desc_lower or 'lead' in desc_lower or 'principal' in desc_lower:
+                return "Senior"
+            elif 'mid' in desc_lower or 'intermediate' in desc_lower:
+                return "Mid-level"
+            elif 'junior' in desc_lower or 'entry' in desc_lower or 'fresher' in desc_lower:
+                return "Entry-level"
+            else:
+                # Try to extract years from description
+                import re
+                year_matches = re.findall(r'(\d+)\+?\s*years?', desc_lower)
+                if year_matches:
+                    years = max([int(y) for y in year_matches])
+                    if years >= 5:
+                        return "Senior"
+                    elif years >= 2:
+                        return "Mid-level"
+                    else:
+                        return "Entry-level"
+                
+                return "Mid-level"  # Default
+                
+        except Exception as e:
+            return "Mid-level"
 
     def _parse_skills(self, skills_str: str) -> List[str]:
         """Parse skills string into list"""

@@ -27,30 +27,142 @@ class JobAgent:
             # General job query
             return self.rag_engine.query_knowledge_base(query, user_id)
     
-    def find_job_matches(self, user_id: str, user_profile: Dict) -> List[Dict[str, Any]]:
-        """Find job matches based on user profile"""
-        if self.job_dataset is None:
-            return {"error": "Job dataset not loaded"}
-        
-        # Convert user profile to search query
-        search_query = self._profile_to_search_query(user_profile)
-        
-        # Use RAG to find matching jobs
-        results = self.rag_engine.query_jobs(search_query, user_profile)
-        
-        # Rank and filter results
-        ranked_jobs = self._rank_jobs(results["jobs"], user_profile)
-        
-        return {
-            "user_id": user_id,
-            "search_query": search_query,
-            "matches": ranked_jobs[:10],  # Top 10 matches
-            "match_metrics": {
-                "total_found": len(ranked_jobs),
-                "top_matches": min(10, len(ranked_jobs)),
-                "match_confidence": "high" if len(ranked_jobs) > 5 else "medium"
+    def find_job_matches(self, user_id: str, user_profile: Dict, use_api: bool = True) -> Dict[str, Any]:
+        """Find job matches with API integration"""
+        try:
+            search_query = self._profile_to_search_query(user_profile)
+            
+            print(f"🔍 Searching with query: '{search_query}' (API: {use_api})")
+            
+            # Get matches from RAG engine with API integration
+            results = self.rag_engine.query_jobs(search_query, user_profile, use_api=use_api)
+            
+            # Format jobs for frontend
+            formatted_matches = []
+            for job in results.get("jobs", []):
+                metadata = job.get("metadata", {})
+                formatted_job = {
+                    "id": job.get("id", f"job_{hash(str(metadata))}"),
+                    "title": metadata.get("title", "Unknown Position"),
+                    "company": metadata.get("company", "Unknown Company"),
+                    "location": metadata.get("location", "Remote"),
+                    "description": job.get("content", "")[:200] + "...",
+                    "required_skills": metadata.get("required_skills", ""),
+                    "experience_level": metadata.get("experience_level", "Not specified"),
+                    "job_type": metadata.get("job_type", "Full-time"),
+                    "salary": metadata.get("salary", "Not specified"),
+                    "relevance_score": job.get("relevance_score", 0),
+                    "skill_match": job.get("skill_match", "N/A"),
+                    "apply_url": metadata.get("apply_url", ""),  # Added for API jobs
+                    "source": job.get("source", "local")  # Added to identify source
+                }
+                formatted_matches.append(formatted_job)
+            
+            print(f"🎯 Formatted {len(formatted_matches)} matches ({results.get('sources', {})})")
+            
+            return {
+                "user_id": user_id,
+                "search_query": search_query,
+                "matches": formatted_matches[:10],
+                "match_metrics": {
+                    "total_found": len(formatted_matches),
+                    "top_matches": min(10, len(formatted_matches)),
+                    "match_confidence": "high" if len(formatted_matches) > 5 else "medium",
+                    "sources": results.get("sources", {})
+                },
+                "insights": results.get("insights", {}),
+                "recommendations": results.get("recommendations", [])
             }
-        }
+        except Exception as e:
+            print(f"❌ Job matching failed: {e}")
+            return {
+                "error": f"Job matching failed: {str(e)}",
+                "matches": [],
+                "match_metrics": {"total_found": 0, "top_matches": 0, "match_confidence": "low"}
+            }
+    # def find_job_matches(self, user_id: str, user_profile: Dict) -> Dict[str, Any]:
+    #     """Find job matches with FALLBACK search"""
+    #     try:
+    #         # Convert user profile to search query
+    #         search_query = self._profile_to_search_query(user_profile)
+            
+    #         print(f"🔍 Searching with query: '{search_query}'")
+            
+    #         # Try different search strategies
+    #         results = None
+            
+    #         # Strategy 1: Try exact search
+    #         results = self.rag_engine.query_jobs(search_query, user_profile)
+            
+    #         # Strategy 2: If no results, try broader search
+    #         if not results.get("jobs"):
+    #             print("🔄 No results with exact search, trying broader terms...")
+    #             broader_terms = [" ".join(user_profile.get("skills", ["developer"]))]
+    #             for term in broader_terms:
+    #                 fallback_results = self.rag_engine.query_jobs(term, user_profile)
+    #                 if fallback_results.get("jobs"):
+    #                     results = fallback_results
+    #                     break
+            
+    #         # Strategy 3: If still no results, get all jobs and filter client-side
+    #         if not results.get("jobs"):
+    #             print("🔄 Using fallback: getting all jobs...")
+    #             all_jobs = self.rag_engine.vector_store.search("job_descriptions", "", 50)
+    #             if all_jobs:
+    #                 # Filter and rank manually
+    #                 filtered_jobs = self.rag_engine._filter_jobs_client_side(all_jobs, user_profile)
+    #                 ranked_jobs = self.rag_engine._rank_jobs_by_relevance(filtered_jobs, user_profile)
+                    
+    #                 results = {
+    #                     "jobs": ranked_jobs,
+    #                     "query": search_query,
+    #                     "total_found": len(ranked_jobs),
+    #                     "fallback_used": True
+    #                 }
+            
+    #         # Format jobs for frontend
+    #         formatted_matches = []
+    #         for job in results.get("jobs", []):
+    #             metadata = job.get("metadata", {})
+    #             formatted_job = {
+    #                 "id": job.get("id", f"job_{hash(str(metadata))}"),
+    #                 "title": metadata.get("title", "Unknown Position"),
+    #                 "company": metadata.get("company", "Unknown Company"),
+    #                 "location": metadata.get("location", "Remote"),
+    #                 "description": job.get("content", "")[:200] + "...",
+    #                 "required_skills": metadata.get("required_skills", ""),
+    #                 "experience_level": metadata.get("experience_level", "Not specified"),
+    #                 "job_type": metadata.get("job_type", "Full-time"),
+    #                 "salary": metadata.get("salary", "Not specified"),
+    #                 "relevance_score": job.get("relevance_score", 0),
+    #                 "skill_match": job.get("skill_match", "N/A")
+    #             }
+    #             formatted_matches.append(formatted_job)
+            
+    #         print(f"🎯 Formatted {len(formatted_matches)} matches for frontend")
+            
+    #         return {
+    #             "user_id": user_id,
+    #             "search_query": search_query,
+    #             "matches": formatted_matches[:10],
+    #             "match_metrics": {
+    #                 "total_found": len(formatted_matches),
+    #                 "top_matches": min(10, len(formatted_matches)),
+    #                 "match_confidence": "high" if len(formatted_matches) > 5 else "medium"
+    #             },
+    #             "insights": results.get("insights", {}),
+    #             "recommendations": results.get("recommendations", [])
+    #         }
+            
+    #     except Exception as e:
+    #         print(f"❌ Job matching failed: {e}")
+    #         import traceback
+    #         traceback.print_exc()
+    #         return {
+    #             "error": f"Job matching failed: {str(e)}",
+    #             "matches": [],
+    #             "match_metrics": {"total_found": 0, "top_matches": 0, "match_confidence": "low"}
+    #         }
     
     def generate_cover_letter(self, user_id: str, job_id: str) -> Dict[str, Any]:
         """Generate personalized cover letter for a job"""
@@ -114,36 +226,56 @@ class JobAgent:
         }
     
     def _profile_to_search_query(self, user_profile: Dict) -> str:
-        """Convert user profile to job search query"""
+        """Convert user profile to job search query - SIMPLIFIED FOR API"""
         skills = user_profile.get("skills", [])
-        experience = user_profile.get("experience_level", "entry")
+        experience = user_profile.get("experience_level", "")
         location = user_profile.get("location", "")
-        industry = user_profile.get("industry", "")
+        keywords = user_profile.get("keywords", "")
         
         query_parts = []
         
+        # Priority 1: Use keywords if provided (most specific)
+        if keywords and keywords.strip():
+            query_parts.append(keywords.strip())
+        
+        # Priority 2: Add 1-2 main skills (keep it simple for API)
         if skills:
-            query_parts.extend(skills[:3])  # Top 3 skills
+            if isinstance(skills, list):
+                # Use only the first 1-2 skills to avoid overly specific queries
+                main_skills = skills[:2]
+                query_parts.extend(main_skills)
+            else:
+                query_parts.append(str(skills))
         
-        if industry:
-            query_parts.append(industry)
+        # Priority 3: Add experience level only if not already in keywords
+        if experience and experience.lower() in ["entry", "junior"]:
+            if not any(exp_term in " ".join(query_parts).lower() for exp_term in ["entry", "junior", "fresher"]):
+                query_parts.append("entry level")
+        elif experience and experience.lower() == "senior":
+            if not any(exp_term in " ".join(query_parts).lower() for exp_term in ["senior", "lead", "principal"]):
+                query_parts.append("senior")
+        
+        # If no specific query, use broader terms that work well with API
+        if not query_parts:
+            query_parts = ["developer", "software engineer", "technology"]
+        
+        # Limit query length for API compatibility (max 3-4 terms)
+        final_query = " ".join(query_parts[:3])
+        print(f"🎯 Generated API search query: '{final_query}'")
+        return final_query
+        
+        def _rank_jobs(self, jobs: List[Dict], user_profile: Dict) -> List[Dict]:
+            """Rank jobs based on relevance to user profile"""
+            # Simple ranking based on skill matching
+            user_skills = set(skill.lower() for skill in user_profile.get("skills", []))
             
-        query_parts.append(f"{experience} level")
-        
-        return " ".join(query_parts)
-    
-    def _rank_jobs(self, jobs: List[Dict], user_profile: Dict) -> List[Dict]:
-        """Rank jobs based on relevance to user profile"""
-        # Simple ranking based on skill matching
-        user_skills = set(skill.lower() for skill in user_profile.get("skills", []))
-        
-        for job in jobs:
-            job_skills = set(skill.lower() for skill in job.get("required_skills", []))
-            matching_skills = user_skills.intersection(job_skills)
-            job["match_score"] = len(matching_skills) / max(len(job_skills), 1)
-            job["matching_skills"] = list(matching_skills)
-        
-        return sorted(jobs, key=lambda x: x.get("match_score", 0), reverse=True)
+            for job in jobs:
+                job_skills = set(skill.lower() for skill in job.get("required_skills", []))
+                matching_skills = user_skills.intersection(job_skills)
+                job["match_score"] = len(matching_skills) / max(len(job_skills), 1)
+                job["matching_skills"] = list(matching_skills)
+            
+            return sorted(jobs, key=lambda x: x.get("match_score", 0), reverse=True)
     
     def _get_job_details(self, job_id: str) -> Dict:
         """Get job details from dataset"""

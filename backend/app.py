@@ -13,7 +13,13 @@ from core.rag_engine import RAGEngine
 load_dotenv()
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, resources={
+    r"/api/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"]
+    }
+})
 
 class EduHireAI:
     def __init__(self):
@@ -59,6 +65,24 @@ class EduHireAI:
 
 # Global system instance
 eduhire_system = EduHireAI()
+
+@app.before_request
+def handle_preflight():
+    """Handle CORS preflight requests"""
+    if request.method == "OPTIONS":
+        response = jsonify({"status": "success"})
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
+        response.headers.add("Access-Control-Allow-Methods", "GET,PUT,POST,DELETE,OPTIONS")
+        return response
+
+@app.after_request
+def after_request(response):
+    """Add CORS headers to all responses"""
+    response.headers.add('Access-Control-Allow-Origin', '*')
+    response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
+    response.headers.add('Access-Control-Allow-Methods', 'GET,PUT,POST,DELETE,OPTIONS')
+    return response
 
 @app.route('/')
 def home():
@@ -302,18 +326,49 @@ def learning_recommendations():
 
 @app.route('/api/generate/cover-letter', methods=['POST'])
 def generate_cover_letter():
-    """Generate personalized cover letter - FIXED version"""
+    """Generate personalized cover letter - IMPROVED"""
     try:
         data = request.get_json()
+        if not data:
+            return jsonify({"error": "No data provided"}), 400
+            
         user_id = data.get('user_id')
         job_id = data.get('job_id')
         job_description = data.get('job_description')
+        job_data = data.get('job_data')  # Added for frontend compatibility
         
-        if not job_id and not job_description:
-            return jsonify({"error": "Either job_id or job_description is required"}), 400
+        print(f"📝 Generating cover letter for user: {user_id}")
         
-        # If job_description is provided, use it directly
-        if job_description:
+        # If job_data is provided from frontend, use it directly
+        if job_data:
+            job_title = job_data.get('title', 'the position')
+            company = job_data.get('company', 'Target Company')
+            job_description = job_data.get('description', job_description)
+            
+            # Create job data structure for RAG engine
+            formatted_job_data = {
+                "content": job_description or f"Position: {job_title} at {company}",
+                "metadata": {
+                    "title": job_title,
+                    "company": company,
+                    "description": job_description
+                }
+            }
+            
+            # Get user profile (in real app, from database)
+            user_profile = {
+                "skills": data.get('user_skills', ['Python', 'Machine Learning', 'GenAI']),
+                "experience_level": data.get('experience_level', 'Entry'),
+                "learning_goals": data.get('learning_goals', 'Learn advanced skills')
+            }
+            
+            cover_letter = eduhire_system.rag_engine.generate_cover_letter(
+                formatted_job_data, 
+                user_profile,
+                user_skills=data.get('user_skills')
+            )
+            
+        elif job_description:
             # Create a mock job data structure
             job_data = {
                 "content": job_description,
@@ -324,22 +379,52 @@ def generate_cover_letter():
                 }
             }
             
-            # Get user profile (in real app, from database)
             user_profile = {
                 "skills": ["Python", "Machine Learning", "GenAI"],
                 "experience_level": "Entry",
-                "learning_goals": "Learn advanced Python, Master ML algorithms, Prepare for GenAI interviews"
+                "learning_goals": "Learn advanced Python, Master ML algorithms"
             }
             
             cover_letter = eduhire_system.rag_engine.generate_cover_letter(job_data, user_profile)
         else:
-            # Use job_id to find the job
-            cover_letter = eduhire_system.job_agent.generate_cover_letter(user_id, job_id)
+            return jsonify({"error": "Either job_data or job_description is required"}), 400
         
-        return jsonify({"cover_letter": cover_letter})
+        return jsonify({
+            "cover_letter": cover_letter,
+            "job_title": job_data.get('metadata', {}).get('title', 'Unknown Position'),
+            "company": job_data.get('metadata', {}).get('company', 'Unknown Company')
+        })
         
     except Exception as e:
         print(f"❌ Cover letter generation error: {e}")
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/api/job/api-search', methods=['POST'])
+def api_job_search():
+    """Search jobs using external API only"""
+    try:
+        data = request.get_json()
+        query = data.get('query', 'developer')
+        location = data.get('location', '')
+        
+        # Use the job API directly
+        api_results = eduhire_system.rag_engine.job_api.search_jobs(query, location)
+        
+        if api_results.get("success"):
+            return jsonify({
+                "status": "success",
+                "query": query,
+                "location": location,
+                "jobs": api_results.get("jobs", []),
+                "total": api_results.get("total", 0)
+            })
+        else:
+            return jsonify({
+                "error": api_results.get("error", "API search failed"),
+                "status": "error"
+            }), 500
+            
+    except Exception as e:
         return jsonify({"error": str(e)}), 500
     
 @app.route('/api/debug/learning', methods=['POST'])
@@ -399,28 +484,340 @@ def debug_azure_status():
     
 @app.route('/api/debug/jobs', methods=['GET'])
 def debug_jobs():
-    """Debug endpoint to check job data"""
+    """Debug endpoint to check job data in database"""
     try:
-        # Test search with a simple query
-        results = eduhire_system.rag_engine.vector_store.search("job_descriptions", "python", 5)
+        # Test search with different queries
+        test_queries = ["python", "machine learning", "data", "developer", "ai"]
         
-        job_info = []
+        debug_info = {
+            "collections": list(eduhire_system.vector_store.collections.keys()),
+            "test_searches": {}
+        }
+        
+        for query in test_queries:
+            try:
+                results = eduhire_system.vector_store.search("job_descriptions", query, 5)
+                debug_info["test_searches"][query] = {
+                    "found": len(results),
+                    "sample_titles": [job.get("metadata", {}).get("title", "No title") for job in results[:3]]
+                }
+            except Exception as e:
+                debug_info["test_searches"][query] = {"error": str(e)}
+        
+        # Also check what's actually in the collection
+        try:
+            # Try to get all jobs (with a high limit)
+            all_jobs = eduhire_system.vector_store.search("job_descriptions", "", 100)
+            debug_info["all_jobs_sample"] = [
+                {
+                    "title": job.get("metadata", {}).get("title", "No title"),
+                    "company": job.get("metadata", {}).get("company", "No company"),
+                    "location": job.get("metadata", {}).get("location", "No location"),
+                    "skills": job.get("metadata", {}).get("required_skills", "No skills")
+                }
+                for job in all_jobs[:5]  # Show first 5 jobs
+            ]
+            debug_info["total_jobs_in_db"] = len(all_jobs)
+        except Exception as e:
+            debug_info["all_jobs_error"] = str(e)
+        
+        return jsonify(debug_info)
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/api/test/job-search', methods=['POST'])
+def test_job_search():
+    """Test job search with simple query"""
+    try:
+        data = request.get_json()
+        query = data.get('query', 'python')
+        
+        print(f"🧪 Testing job search with query: '{query}'")
+        
+        # Direct vector store search
+        results = eduhire_system.vector_store.search("job_descriptions", query, 10)
+        
+        response = {
+            "test_query": query,
+            "results_found": len(results),
+            "jobs": []
+        }
+        
         for i, job in enumerate(results):
             metadata = job.get("metadata", {})
-            job_info.append({
-                "index": i,
+            response["jobs"].append({
+                "rank": i + 1,
                 "title": metadata.get("title", "No title"),
                 "company": metadata.get("company", "No company"),
-                "location": metadata.get("location", "No location"),
-                "skills": metadata.get("required_skills", "No skills")
+                "content_preview": job.get("content", "")[:100] + "..."
+            })
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/debug/csv-structure', methods=['GET'])
+def debug_csv_structure():
+    """Check the actual CSV file structure"""
+    try:
+        csv_path = "data/job_dataset.csv"
+        if not os.path.exists(csv_path):
+            return jsonify({"error": f"CSV file not found at {csv_path}"}), 400
+        
+        import pandas as pd
+        df = pd.read_csv(csv_path)
+        
+        return jsonify({
+            "csv_exists": True,
+            "total_rows": len(df),
+            "columns": list(df.columns),
+            "sample_data": df.head(3).to_dict('records'),
+            "dtypes": dict(df.dtypes)
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/debug/csv-sample', methods=['GET'])
+def debug_csv_sample():
+    """Check actual CSV data sample"""
+    try:
+        csv_path = "data/job_dataset.csv"
+        if not os.path.exists(csv_path):
+            return jsonify({"error": f"CSV file not found at {csv_path}"}), 400
+        
+        import pandas as pd
+        df = pd.read_csv(csv_path)
+        
+        # Show first 3 rows with all columns
+        sample_data = []
+        for i in range(min(3, len(df))):
+            row_data = {}
+            for col in df.columns:
+                value = df.iloc[i][col]
+                # Convert numpy types to Python native types for JSON serialization
+                if pd.isna(value):
+                    row_data[col] = None
+                elif hasattr(value, 'item'):  # For numpy types
+                    row_data[col] = value.item() if hasattr(value, 'item') else str(value)
+                else:
+                    row_data[col] = str(value)[:100] + "..." if len(str(value)) > 100 else str(value)
+            sample_data.append(row_data)
+        
+        return jsonify({
+            "csv_exists": True,
+            "total_rows": len(df),
+            "columns": list(df.columns),
+            "sample_data": sample_data
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/debug/api-raw', methods=['POST'])
+def debug_api_raw():
+    """Debug raw API results without filtering"""
+    try:
+        data = request.get_json()
+        query = data.get('query', 'Python developer')
+        location = data.get('location', '')
+        
+        # Get raw API results
+        api_results = eduhire_system.rag_engine.job_api.search_jobs(query, location)
+        
+        if api_results.get("success"):
+            # Show raw jobs before any filtering
+            raw_jobs = []
+            for job in api_results.get("jobs", []):
+                metadata = job.get("metadata", {})
+                raw_jobs.append({
+                    "title": metadata.get("title"),
+                    "company": metadata.get("company"),
+                    "location": metadata.get("location"),
+                    "experience_level": metadata.get("experience_level"),
+                    "skills": metadata.get("required_skills"),
+                    "source": job.get("source")
+                })
+            
+            return jsonify({
+                "status": "success",
+                "raw_api_results": raw_jobs,
+                "total_raw": len(raw_jobs),
+                "query_used": query,
+                "location_used": location
+            })
+        else:
+            return jsonify({
+                "error": api_results.get("error", "API failed"),
+                "status": "error"
+            }), 500
+            
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/api/debug/all-jobs', methods=['POST'])
+def debug_all_jobs():
+    """Debug endpoint to see ALL available jobs"""
+    try:
+        data = request.get_json()
+        user_profile = data.get('user_profile', {})
+        
+        # Get all jobs from both sources
+        all_local_jobs = eduhire_system.vector_store.search("job_descriptions", "", 100)
+        api_results = eduhire_system.rag_engine.job_api.search_jobs("Python", "hyderabad")
+        api_jobs = api_results.get("jobs", []) if api_results.get("success") else []
+        
+        response_data = {
+            "local_jobs_count": len(all_local_jobs),
+            "api_jobs_count": len(api_jobs),
+            "local_jobs_sample": [
+                {
+                    "title": job.get("metadata", {}).get("title"),
+                    "company": job.get("metadata", {}).get("company"),
+                    "location": job.get("metadata", {}).get("location")
+                }
+                for job in all_local_jobs[:5]
+            ],
+            "api_jobs_sample": [
+                {
+                    "title": job.get("metadata", {}).get("title"),
+                    "company": job.get("metadata", {}).get("company"), 
+                    "location": job.get("metadata", {}).get("location")
+                }
+                for job in api_jobs[:5]
+            ]
+        }
+        
+        return jsonify(response_data)
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
+@app.route('/api/jobs/all', methods=['GET'])
+def get_all_jobs():
+    """Get all jobs directly from database - FOR DEBUGGING"""
+    try:
+        # Get all jobs without search
+        all_jobs = eduhire_system.vector_store.search("job_descriptions", "", 100)
+        
+        formatted_jobs = []
+        for job in all_jobs:
+            metadata = job.get("metadata", {})
+            formatted_jobs.append({
+                "title": metadata.get("title", "No Title"),
+                "company": metadata.get("company", "No Company"),
+                "location": metadata.get("location", "No Location"),
+                "skills": metadata.get("required_skills", "No Skills"),
+                "experience_level": metadata.get("experience_level", "Not specified"),
+                "description_preview": job.get("content", "")[:100] + "..."
             })
         
         return jsonify({
-            "total_jobs_in_db": len(results),
-            "sample_jobs": job_info,
-            "status": "success"
+            "total_jobs": len(formatted_jobs),
+            "jobs": formatted_jobs
         })
         
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/job/save', methods=['POST'])
+def save_job():
+    """Save a job for later"""
+    try:
+        data = request.get_json()
+        user_id = data.get('user_id')
+        job_id = data.get('job_id')
+        job_data = data.get('job_data')
+        
+        if not all([user_id, job_id, job_data]):
+            return jsonify({"error": "Missing required fields"}), 400
+        
+        # In a real app, you'd save to a database
+        # For now, we'll just log and return success
+        print(f"💾 User {user_id} saved job {job_id}: {job_data.get('title', 'Unknown')}")
+        
+        return jsonify({
+            "status": "success",
+            "message": "Job saved successfully",
+            "job_id": job_id
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/job/apply', methods=['POST'])
+def apply_to_job():
+    """Apply to a job"""
+    try:
+        data = request.get_json()
+        user_id = data.get('user_id')
+        job_id = data.get('job_id')
+        job_data = data.get('job_data')
+        cover_letter = data.get('cover_letter', '')
+        
+        if not all([user_id, job_id, job_data]):
+            return jsonify({"error": "Missing required fields"}), 400
+        
+        # In a real app, you'd save application to database and maybe send email
+        print(f"📨 User {user_id} applied to job {job_id}: {job_data.get('title', 'Unknown')}")
+        print(f"📝 Cover letter length: {len(cover_letter)} characters")
+        
+        return jsonify({
+            "status": "success", 
+            "message": "Application submitted successfully",
+            "job_id": job_id,
+            "application_id": f"app_{int(datetime.now().timestamp())}"
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/user/saved-jobs', methods=['GET'])
+def get_saved_jobs():
+    """Get user's saved jobs"""
+    try:
+        user_id = request.args.get('user_id')
+        if not user_id:
+            return jsonify({"error": "user_id is required"}), 400
+        
+        # In a real app, you'd fetch from database
+        # For now, return empty list
+        return jsonify({
+            "saved_jobs": [],
+            "total": 0
+        })
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/job/details', methods=['GET'])
+def get_job_details():
+    """Get detailed job information"""
+    try:
+        job_id = request.args.get('job_id')
+        if not job_id:
+            return jsonify({"error": "job_id is required"}), 400
+        
+        # For API jobs, we need to handle them differently
+        if job_id.startswith('api_'):
+            # This would require storing API job details
+            return jsonify({
+                "error": "API job details not stored locally",
+                "job_id": job_id
+            })
+        else:
+            # For local jobs, search in vector store
+            results = eduhire_system.vector_store.search("job_descriptions", job_id, 1)
+            if results:
+                return jsonify({
+                    "job": results[0],
+                    "status": "success"
+                })
+            else:
+                return jsonify({"error": "Job not found"}), 404
+                
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
