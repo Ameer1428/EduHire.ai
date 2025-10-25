@@ -103,18 +103,26 @@ EduHire.ai consists of two major components:
 ### 1️⃣ Clone the Repository
 ```bash
 git clone https://github.com/Ameer1428/EduHire.ai.git
+```
+```bash
 cd eduhire.ai
 ```
-
-
-### 2️⃣ Install Dependencies
+### 2️⃣ Create Virtual Environment
+```bash
+python -m venv venv
+```
+### 3️⃣ Activate Virtual Environment
+```bash
+source venv/bin/activate
+```
+### 4️⃣ Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
-### 3️⃣ Environment Variables
+### 5️⃣ Environment Variables
 ```bash
 JOB_API_KEY=your_job_api_key
-AZURE_OPENAI_ENDPOINT=your_openai_dpoint
+AZURE_OPENAI_ENDPOINT=your_openai_endpoint
 AZURE_OPENAI_MODEL=your_openai_model
 AZURE_OPENAI_API_KEY=your_openai_pi_key
 AZURE_OPENAI_DEPLOYMENT_NAME=your_deployment_name
@@ -122,20 +130,24 @@ AZURE_OPENAI_EMBEDDING_DEPLOYMENT=your_embedding_deployment_name
 AZURE_OPENAI_API_VERSION=your_openai_appi_version
 
 ```
-4️⃣ Run the Backend Server
+### 6️⃣ Run the Backend Server (Flask)
 ```bash
 cd backend
+```
+```bash
 python app.py
 ```
 
-### Server will start on:
+#### Server will start on:
 ```aurdino
 http://localhost:5000
 ```
 
-5️⃣ Run the Frontend (Streamlit)cd frontend
-```
+5️⃣ Run the Frontend (Streamlit)
+```bash
 cd frontend
+```
+```bash
 streamlit run app.py
 ```
 
@@ -152,7 +164,9 @@ POST http://localhost:5000/api/initialize
 POST http://localhost:5000/api/learning/recommend
 {
   "user_id": "ameer01",
-  "learning_goals": ["Generative AI", "Prompt Engineering"]
+  "learning_goals": [
+    "Generative AI", "Prompt Engineering"
+    ]
 }
 ```
 
@@ -161,7 +175,8 @@ POST http://localhost:5000/api/learning/recommend
 POST http://localhost:5000/api/job/match
 {
   "user_id": "ameer01",
-  "user_profile": {
+  "user_profile": 
+  {
     "skills": ["Python", "Flask", "LLMs"],
     "experience_level": "Entry"
   }
@@ -189,7 +204,7 @@ POST http://localhost:5000/api/job/match
 
 ## 🧑‍💻 Author
 
-    Ameer Khan
+  #### Ameer Khan
     👩‍💻 GenAI Trainee
     🌐 GitHub: [Ameer1428](https://github.com/Ameer1428)
     • LinkedIn: https://www.linkedin.com/in/ameerkhan1428/
