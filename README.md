@@ -153,7 +153,6 @@ streamlit run app.py
 
 ## 🧾 Example API Usage
 
-🧾 Example API Usage
 ### Initialize System
 ```bash
 POST http://localhost:5000/api/initialize
